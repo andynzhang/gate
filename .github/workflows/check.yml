@@ -1,8 +1,79 @@
+name: VPN Gate Node Check
+
+on:
+  # 定时检测: 默认每 30 分钟一次。改成每 60 分钟: cron: "0 * * * *"
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: gate-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
+        run: python vpngate.py
+        env:
+          # check.helei.kdns.fr 已停止解析; 检测走仍可用的 CheckSocks5 Worker
+          # 多个地址用逗号分隔, 脚本会依次探测并选用第一个可达的
+          CHECK_WORKER: "https://etjk.nanzhang.kdns.fr/check?sstp=vpn:vpn@"
+          CHECK_CONCURRENCY: "32"
+          CHECK_TIMEOUT: "90"
+
+      - name: Ensure GitHub Pages uses Actions
+        run: |
+          set +e
+          code=$(curl -sS -o /tmp/pages.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
+          echo "Pages GET status: $code"
+          cat /tmp/pages.json || true
+          echo
+          # 首次是 POST 创建; 已存在则 PUT 改成 workflow (不能把 source.path 设成 /public, API 只允许 / 或 /docs)
+          if [ "$code" = "404" ]; then
+            method=POST
+          else
+            method=PUT
+          fi
+          curl -sS -X "$method" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d '{"build_type":"workflow"}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages" || true
+          echo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
         uses: actions/upload-pages-artifact@v4
         with:
           path: 'public'
+
   deploy:
     needs: check
     runs-on: ubuntu-latest
@@ -13,128 +84,6 @@
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
       - name: Show site URL
-        run: 'echo "site: https://jerylihub.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
         run: 'echo "site: ${{ steps.deployment.outputs.page_url }}"'
-
-[66 lines collapsed]
-
-    "VPNGATE_MIRROR",
-    (
-        "https://cdn.jsdelivr.net/gh/bagussatoto/Vpngate-Scraper-API@main/json/data.json",
-        "https://fastly.jsdelivr.net/gh/bagussatoto/Vpngate-Scraper-API@main/json/data.json",
-        "https://cdn.jsdelivr.net/gh/fdciabdul/Vpngate-Scraper-API@main/json/data.json",
-        "https://raw.githubusercontent.com/bagussatoto/Vpngate-Scraper-API/refs/heads/main/json/data.json",
-        "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/refs/heads/main/json/data.json",
-
-[72 lines collapsed]
-
-# 第 1 步: 获取 VPN Gate 原始节点
-# ---------------------------------------------------------------------------
-def _http_get(url, timeout=None):
-    t = timeout or HTTP_TIMEOUT
-    if not isinstance(t, tuple):
-        # 连接超时单独缩短, 避免官方站/已删镜像卡住 60s 才轮询下一个源
-        t = (min(12, float(t)), float(t))
-    return requests.get(
-        url,
-        timeout=timeout or HTTP_TIMEOUT,
-        timeout=t,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-    )
-
-[233 lines collapsed]
-
-    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["exit"] = None
-    out["residential"] = "unknown"
-    try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
-    last_err = None
-    # 公共 Worker 可能 429/5xx; 只对这类瞬时错误短重试, 避免把 90s 超时再乘 3
-    for attempt in range(3):
-        try:
-            r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-            if r.status_code in (429, 502, 503, 520, 522, 524) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                last_err = f"HTTP {r.status_code}"
-                continue
-            if r.status_code != 200:
-                out["error"] = f"HTTP {r.status_code}"
-                out["worker_error"] = True
-                return out
-            j = r.json()
-            ok = bool(j.get("success"))
-            out["success"] = ok
-            out["status"] = "success" if ok else "failed"
-            out["latency_ms"] = j.get("responseTime")
-            out["colo"] = j.get("colo")
-            out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-            # SSTP 版 Worker: exit 在顶层; 新版 CheckSocks5 把国家/城市放在 location 里
-            exit_info = j.get("exit") or {}
-            if exit_info:
-                asn = exit_info.get("asn") or {}
-                loc = exit_info.get("location") or {}
-                org = asn.get("org") or asn.get("name") or ""
-                out["exit"] = {
-                    "ip": exit_info.get("ip"),
-                    "country": exit_info.get("country") or loc.get("country"),
-                    "country_code": exit_info.get("country_code") or loc.get("country_code"),
-                    "city": exit_info.get("city") or loc.get("city"),
-                    "continent": exit_info.get("continent") or loc.get("continent"),
-                    "asn": asn.get("asn"),
-                    "org": org,
-                    "type": asn.get("type"),
-                    "is_datacenter": exit_info.get("is_datacenter"),
-                }
-                out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-            else:
-                out["residential"] = classify_network(out["host"], None, None)
-            return out
-        except Exception as exc:
-            last_err = f"{type(exc).__name__}: {exc}"
-            if attempt < 2 and "Timeout" not in type(exc).__name__:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            out["error"] = last_err
-            out["worker_error"] = True
-            return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
-    except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        out["worker_error"] = True
-        return out
-    out["error"] = last_err or "worker retry exhausted"
-    out["worker_error"] = True
-    return out
-def check_all(nodes, session):
-
-[349 lines collapsed]
